@@ -4,14 +4,16 @@
 #include <timeseries.h>
 #include <assert.h>
 #include <libipmeta.h>
+#include <timeseries.h>
 
 #include <arpa/inet.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <unistd.h>
 #include <getopt.h>
 
 #define DEFAULT_CONSUMER_TOPIC "tsk-production.graphite.active.ping-slash24.team-1.slash24test"
-#define DEFAULT_PRODUCER_TOPIC "tsk-production.graphite.active.latencyloss"
+#define DEFAULT_PRODUCER_TOPIC "graphite.active.latencyloss"
 
 #define DEFAULT_CONSUMER_GROUP "ap_slash24_aggregator"
 
@@ -22,7 +24,12 @@ static const char *continent_strings[] = {
     "??", "AF", "AN", "AS", "EU", "NA", "OC", "SA",
 };
 
-
+enum {
+    RESULT_TYPE_GEO,
+    RESULT_TYPE_ASN,
+    RESULT_TYPE_GEOASN_COUNTRY,
+    RESULT_TYPE_GEOASN_REGION,
+};
 
 typedef struct results {
     Pvoid_t continents;
@@ -41,6 +48,7 @@ typedef struct kafka_consumer_handle {
     char *brokers;
     char *topicname;
     char *consumer_group;
+    char *teamname;
 
     rd_kafka_t *rdk_conn;
     rd_kafka_topic_t *rdk_topic;
@@ -54,10 +62,12 @@ typedef struct kafka_consumer_handle {
 typedef struct kafka_producer_handle {
     char *brokers;
     char *topicname;
-    rd_kafka_t *rdk_conn;
-    rd_kafka_topic_t *rdk_topic;
     int connected;
     int fatal_error;
+
+    timeseries_t *timeseries;
+    timeseries_kp_t *kp;
+    uint32_t produced;
 } kafka_producer_handle_t;
 
 
@@ -82,6 +92,60 @@ typedef struct cumulative_result {
 
     uint64_t s24_ips;       // used only for staging
 } cumulative_result_t;
+
+
+static int init_libtimeseries(kafka_producer_handle_t *hdl) {
+
+    char tmpbuf[4096];
+    timeseries_backend_t *backend;
+
+    if (hdl->brokers == NULL) {
+        fprintf(stderr, "No brokers specified for kafka output!\n");
+        return -1;
+    }
+
+    if (hdl->topicname == NULL) {
+        fprintf(stderr, "No topicname specified for kafka output!\n");
+        return -1;
+    }
+
+    snprintf(tmpbuf, 4096, "-b %s -p tsk-production -c %s -f ascii",
+            hdl->brokers, hdl->topicname);
+
+    hdl->timeseries = timeseries_init();
+    if (hdl->timeseries == NULL) {
+        fprintf(stderr, "Unable to initialize timeseries_t\n");
+        return -1;
+    }
+
+    backend = timeseries_get_backend_by_name(hdl->timeseries, "kafka");
+    if (backend == NULL) {
+        fprintf(stderr, "Kafka backend is not supported by your current version of libtimeseries\n");
+        return -1;
+    }
+
+    if (timeseries_enable_backend(backend, tmpbuf) != 0) {
+        fprintf(stderr, "Unable to enable Kafka backend with arguments '%s'\n",
+                tmpbuf);
+        return -1;
+    }
+
+    hdl->kp = timeseries_kp_init(hdl->timeseries, TIMESERIES_KP_RESET);
+    if (!hdl->kp) {
+        fprintf(stderr, "Unable to initialize key package for libtimeseries\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void destroy_libtimeseries(kafka_producer_handle_t *hdl) {
+    if (hdl->kp) {
+        timeseries_kp_free(&(hdl->kp));
+    }
+    if (hdl->timeseries) {
+        timeseries_free(&(hdl->timeseries));
+    }
+}
 
 static int init_ipmeta(ipmeta_handle_t *ipm) {
 
@@ -140,6 +204,10 @@ static int init_ipmeta(ipmeta_handle_t *ipm) {
         return -1;
     }
 
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    fprintf(stderr, "IPmeta init completed: %lu\n", tv.tv_sec);
     return 0;
 }
 
@@ -260,87 +328,6 @@ static void kafka_error_callback(rd_kafka_t *rk, int err, const char *reason,
 
 }
 
-static void kafka_producer_error_callback(rd_kafka_t *rk, int err,
-        const char *reason, void *opaque) {
-
-    kafka_producer_handle_t *hdl = (kafka_producer_handle_t *)opaque;
-
-    switch (err) {
-        case RD_KAFKA_RESP_ERR__BAD_COMPRESSION:
-        case RD_KAFKA_RESP_ERR__RESOLVE:
-            hdl->fatal_error = 1;
-            // fall through
-        case RD_KAFKA_RESP_ERR__DESTROY:
-        case RD_KAFKA_RESP_ERR__FAIL:
-        case RD_KAFKA_RESP_ERR__TRANSPORT:
-        case RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN:
-            hdl->connected = 0;
-            break;
-    }
-
-    fprintf(stderr, "Kafka error detected in producer: %s (%d): %s\n",
-            rd_kafka_err2str(err), err, reason);
-
-}
-
-int rdkafka_producer_connect(kafka_producer_handle_t *hdl) {
-
-    rd_kafka_conf_t *conf = rd_kafka_conf_new();
-    char errorstr[512];
-
-    rd_kafka_conf_set_opaque(conf, hdl);
-    rd_kafka_conf_set_error_cb(conf, kafka_producer_error_callback);
-    if (rd_kafka_conf_set(conf, "api.version.request", "true", errorstr,
-                512) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "Error setting kafka configuration: %s\n", errorstr);
-        rd_kafka_conf_destroy(conf);
-        return -1;
-    }
-
-    if (rd_kafka_conf_set(conf, "batch.num.messages", "100", errorstr,
-                512) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "Error setting kafka configuration: %s\n", errorstr);
-        rd_kafka_conf_destroy(conf);
-        return -1;
-    }
-
-    if (rd_kafka_conf_set(conf, "queue.buffering.max.ms", "500", errorstr,
-                512) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "Error setting kafka configuration: %s\n", errorstr);
-        rd_kafka_conf_destroy(conf);
-        return -1;
-    }
-
-    if (rd_kafka_conf_set(conf, "queue.buffering.max.messages", "500", errorstr,
-                512) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "Error setting kafka configuration: %s\n", errorstr);
-        rd_kafka_conf_destroy(conf);
-        return -1;
-    }
-
-
-    hdl->rdk_conn = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errorstr, 512);
-    if (hdl->rdk_conn == NULL) {
-        fprintf(stderr, "Error creating rdkafka producer: %s\n", errorstr);
-        rd_kafka_conf_destroy(conf);
-        return -1;
-    }
-
-    if (rd_kafka_brokers_add(hdl->rdk_conn, hdl->brokers) == 0) {
-        fprintf(stderr, "Error adding brokers to rdkafka producer: %s\n",
-                errorstr);
-        return -1;
-    }
-    hdl->connected = 1;
-    /* make sure our connection succeeded */
-    rd_kafka_poll(hdl->rdk_conn, 5000);
-
-    if (hdl->fatal_error) {
-        return -1;
-    }
-    return 0;
-}
-
 int rdkafka_consumer_connect(kafka_consumer_handle_t *hdl) {
     rd_kafka_conf_t *conf = rd_kafka_conf_new();
     char errorstr[512];
@@ -417,20 +404,6 @@ int rdkafka_topic_connect(kafka_consumer_handle_t *hdl) {
     return 0;
 }
 
-int rdkafka_producer_topic_connect(kafka_producer_handle_t *hdl) {
-    if (hdl->fatal_error) {
-        return -1;
-    }
-    hdl->rdk_topic = rd_kafka_topic_new(hdl->rdk_conn, hdl->topicname, NULL);
-    if (hdl->rdk_topic == NULL) {
-        fprintf(stderr, "Error while creating the kafka producer topic handle: %s\n",
-                rd_kafka_err2str(rd_kafka_last_error()));
-        return -1;
-    }
-
-    return 0;
-}
-
 static void commit_staged_results(Pvoid_t *staged, Pvoid_t *results) {
 
     PWord_t pval, pval2;
@@ -463,21 +436,86 @@ static void commit_staged_results(Pvoid_t *staged, Pvoid_t *results) {
     JSLFA(rc, *staged);
 }
 
+static inline int update_timeseries_value(timeseries_kp_t *kp,
+        char *identifier, char *teamname,
+        uint8_t final, char *metric, uint8_t resulttype,
+        uint64_t value) {
+
+    char fulltskey[8192];
+    int kval;
+
+    if (resulttype == RESULT_TYPE_GEO) {
+        snprintf(fulltskey, 8192, "active.ping-slash24.geo.ipinfo.%s.%s.%s.%s",
+                identifier, teamname, final ? "final" : "provisional", metric);
+    } else if (resulttype == RESULT_TYPE_ASN) {
+
+    } else if (resulttype == RESULT_TYPE_GEOASN_COUNTRY) {
+
+    } else if (resulttype == RESULT_TYPE_GEOASN_REGION) {
+
+    } else {
+        return -1;
+    }
+
+
+    kval = timeseries_kp_get_key(kp, fulltskey);
+    if (kval == -1) {
+        kval = timeseries_kp_add_key(kp, fulltskey);
+    }
+    if (kval == -1) {
+        fprintf(stderr, "Warning: unable to add timeseries key for %s\n",
+                fulltskey);
+        return -1;
+    }
+    timeseries_kp_set(kp, kval, value);
+    return 0;
+}
+
 static void emit_results_to_kafka(kafka_producer_handle_t *hdl,
-        Pvoid_t *map, uint64_t timestamp) {
+        Pvoid_t *map, uint64_t timestamp, char *teamname, uint8_t final,
+        uint8_t resulttype) {
 
     PWord_t pval;
     cumulative_result_t *cr;
     uint8_t index[512];
+    uint64_t addval = 0;
+    double tmp;
+    struct timeval tv;
 
     index[0] = '\0';
 
+    gettimeofday(&tv, NULL);
+    fprintf(stderr, "%lu -- Generating results for round %u (%lu)\n", tv.tv_sec,
+            hdl->produced + 1, timestamp);
     JSLF(pval, *map, index);
     while (pval) {
         cr = (cumulative_result_t *)(*pval);
-        fprintf(stderr, "RESULT: %s %lu %lu %lu %lu\n",
-                cr->identifier, timestamp, cr->latency, cr->probes_sent,
-                cr->probes_lost);
+
+        /* TODO add other statistics for latency, e.g. median, percentiles */
+
+        if (cr->probes_sent > 0) {
+            if (cr->latency > 0 && cr->probes_lost < cr->probes_sent) {
+                addval = (uint64_t)(cr->latency /
+                        (cr->probes_sent - cr->probes_lost));
+                if (update_timeseries_value(hdl->kp, cr->identifier,
+                            teamname, final, "mean_latency", resulttype,
+                            addval) < 0) {
+                    return;
+                }
+            }
+
+            tmp = ((double)cr->probes_lost / cr->probes_sent) * 10000;
+            if (update_timeseries_value(hdl->kp, cr->identifier, teamname,
+                        final, "loss_pct", resulttype, (uint64_t)(tmp)) < 0) {
+                return;
+            }
+        }
+
+        if (update_timeseries_value(hdl->kp, cr->identifier, teamname, final,
+                "probe_count", resulttype, cr->probes_sent) < 0) {
+            return;
+        }
+
         cr->latency = 0;
         cr->probes_sent = 0;
         cr->probes_lost = 0;
@@ -485,7 +523,11 @@ static void emit_results_to_kafka(kafka_producer_handle_t *hdl,
         JSLN(pval, *map, index);
     }
 
-    fprintf(stderr, "------ DONE\n");
+    timeseries_kp_flush(hdl->kp, timestamp);
+    gettimeofday(&tv, NULL);
+    fprintf(stderr, "%lu -- Flushed results for round %u (%lu)\n", tv.tv_sec,
+            hdl->produced + 1, timestamp);
+    hdl->produced ++;
 }
 
 static void update_staged_result_map(Pvoid_t *map, char *identifier,
@@ -551,12 +593,17 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
         return -1;
     }
 
+    if (timestamp < hdl->results.last_timestamp) {
+        /* old timestamp, nothing we can really do about it now... */
+        return 0;
+    }
+
     if (timestamp != hdl->results.last_timestamp &&
             hdl->results.last_timestamp != 0) {
 
         /* end of round -- dump results and reset */
         emit_results_to_kafka(prodhdl, &(hdl->results.countries),
-                hdl->results.last_timestamp);
+                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_GEO);
     }
     hdl->results.last_timestamp = timestamp;
 
@@ -600,6 +647,12 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
         char *dotptr = NULL;
         char *token, *token2, *token3;
 
+
+        /* XXX TEMPORARY */
+        if (prodhdl->produced >= 2) {
+            rd_kafka_consume_stop(hdl->rdk_topic, 0);
+            return -1;
+        }
         rd_kafka_poll(hdl->rdk_conn, 0);
 
         if (hdl->fatal_error) {
@@ -658,7 +711,7 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
                     token3 = strtok_r(token2, ".", &dotptr);
 
                     while(token3) {
-                        if (strcmp(token3, "team-test") == 0) {
+                        if (strcmp(token3, hdl->teamname) == 0) {
                             key_skip = 0;
                         }
                         if (strncmp(token3, "__S24_", 6) == 0) {
@@ -711,6 +764,7 @@ static void usage(char *progname) {
     fprintf(stderr, "    -p \"<config>\"  -- set the IPInfo configuration for libipmeta\n");
     fprintf(stderr, "    -a \"<config>\"  -- set the Prefix2AS configuration for libipmeta\n");
     fprintf(stderr, "    -g <groupname>   -- set the consumer group for kafka\n");
+    fprintf(stderr, "    -M \"<teamname>\"    -- only process measurements from probers belonging to \n    this team (default: team-2)\n");
     fprintf(stderr, "    -t <topicname>   -- set the topic to consume messages from\n");
     fprintf(stderr, "    -T <topicname>   -- set the topic to write aggregated results into\n");
     fprintf(stderr, "    -B <brokers>     -- set the Kafka broker for producing aggregated results\n");
@@ -730,8 +784,11 @@ int main(int argc, char **argv) {
     memset(&prodhdl, 0, sizeof(prodhdl));
     memset(&ipm, 0, sizeof(ipm));
 
-    while ((opt = getopt(argc, argv, "g:t:T:b:B:p:a:")) >= 0) {
+    while ((opt = getopt(argc, argv, "M:g:t:T:b:B:p:a:")) >= 0) {
         switch(opt) {
+            case 'M':
+                kafkahdl.teamname = optarg;
+                break;
             case 'g':
                 kafkahdl.consumer_group = optarg;
                 break;
@@ -763,6 +820,10 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    if (kafkahdl.teamname == NULL) {
+        kafkahdl.teamname = "team-2";
+    }
+
     if (prodhdl.brokers == NULL) {
         prodhdl.brokers = kafkahdl.brokers;
     }
@@ -789,6 +850,11 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    if (init_libtimeseries(&prodhdl) < 0) {
+        fprintf(stderr, "Failed to initialize libtimeseries for kafka output\n");
+        exit(1);
+    }
+
     if (init_ipmeta(&ipm) < 0) {
         fprintf(stderr, "IPMeta configuration failed\n");
         exit(1);
@@ -804,13 +870,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (!prodhdl.connected) {
-            if (rdkafka_producer_connect(&prodhdl) < 0) {
-                sleep(5);
-                continue;
-            }
-        }
-
         if (rdkafka_consume(&kafkahdl, &prodhdl, &ipm) < 0) {
             break;
         }
@@ -818,17 +877,10 @@ int main(int argc, char **argv) {
 
     clear_results(&(kafkahdl.results.countries));
     destroy_ipmeta(&ipm);
-
-    if (prodhdl.rdk_topic) {
-        rd_kafka_topic_destroy(prodhdl.rdk_topic);
-    }
+    destroy_libtimeseries(&prodhdl);
 
     if (kafkahdl.rdk_topic) {
         rd_kafka_topic_destroy(kafkahdl.rdk_topic);
-    }
-
-    if (prodhdl.rdk_conn) {
-        rd_kafka_destroy(prodhdl.rdk_conn);
     }
 
     if (kafkahdl.rdk_conn) {
