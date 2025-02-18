@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <libipmeta.h>
 #include <timeseries.h>
+#include <wandio.h>
 
 #include <arpa/inet.h>
 #include <sys/time.h>
@@ -82,6 +83,8 @@ typedef struct ipmeta_handle {
     char *geoasn_csv_file;
     char *regions_csv_file;
 
+    Pvoid_t known_regions;
+
 } ipmeta_handle_t;
 
 typedef struct cumulative_result {
@@ -147,6 +150,51 @@ static void destroy_libtimeseries(kafka_producer_handle_t *hdl) {
     }
 }
 
+static int load_ipmeta_regions(ipmeta_handle_t *ipm) {
+    io_t *file;
+    char buffer[2048];
+    int read;
+    char *tok;
+    unsigned long reg_id;
+    Word_t rc;
+
+    if (ipm->regions_csv_file == NULL) {
+        return -1;
+    }
+
+    if ((file = wandio_create(ipm->regions_csv_file)) == NULL) {
+        fprintf(stderr, "ERROR: failed to open file '%s'\n",
+                ipm->regions_csv_file);
+        return -1;
+    }
+
+    while ((read = wandio_fgets(file, &buffer, 2048, 0)) > 0) {
+        tok = strtok(buffer, ",");
+        if (tok == NULL) {
+            fprintf(stderr, "Malformed line in region csv file (should be id, fqid, name)\n");
+            fprintf(stderr, "Line was: '%s'\n", buffer);
+            goto failregioncsv;
+        }
+
+        if (strcmp(tok, "ioda_region_id") == 0) {
+            continue;
+        }
+        errno = 0;
+        reg_id = strtoul(tok, NULL, 10);
+        if (errno) {
+            fprintf(stderr, "Invalid value for IODA region ID: %s", tok);
+            continue;
+        }
+
+        J1S(rc, ipm->known_regions, reg_id);
+    }
+    wandio_destroy(file);
+    return 1;
+failregioncsv:
+    wandio_destroy(file);
+    return -1;
+}
+
 static int init_ipmeta(ipmeta_handle_t *ipm) {
 
     char *provider_arg;
@@ -204,6 +252,10 @@ static int init_ipmeta(ipmeta_handle_t *ipm) {
         return -1;
     }
 
+    if (load_ipmeta_regions(ipm) < 0) {
+        fprintf(stderr, "Error: failed to load regions CSV file\n");
+        return -1;
+    }
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -212,6 +264,10 @@ static int init_ipmeta(ipmeta_handle_t *ipm) {
 }
 
 static void destroy_ipmeta(ipmeta_handle_t *ipm) {
+    int rc;
+
+    J1FA(rc, ipm->known_regions);
+
     if (ipm->ipmeta) {
         ipmeta_free(ipm->ipmeta);
         ipm->ipmeta = NULL;
@@ -284,7 +340,8 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
     const char **countries_iso2;
     const char **country_continents;
     char key[512];
-    int cnt, i;
+    int cnt, i, rc;
+    Word_t index;
 
     if (ipmeta_provider_get_all_records(ipm->provider_ipinfo, &records) == 0) {
         fprintf(stderr, "Error: IPMeta is reporting no IPInfo records are loaded\n");
@@ -293,12 +350,22 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
     free(records);
 
     reset_all_results(&(hdl->results.countries));
+    reset_all_results(&(hdl->results.regions));
+    reset_all_results(&(hdl->results.asns));
 
     cnt = ipmeta_provider_maxmind_get_iso2_list(&countries_iso2);
 
     for (i = 0; i < cnt; i++) {
         snprintf(key, 512, "country.%s", countries_iso2[i]);
         insert_single_result(&(hdl->results.countries), key);
+    }
+
+    index = 0;
+    J1F(rc, ipm->known_regions, index);
+    while (rc != 0) {
+        snprintf(key, 512, "region.%lu", index);
+        insert_single_result(&(hdl->results.regions), key);
+        J1N(rc, ipm->known_regions, index);
     }
 
     return 0;
@@ -355,16 +422,31 @@ int rdkafka_consumer_connect(kafka_consumer_handle_t *hdl) {
         return -1;
     }
 
-    hdl->rdk_conn = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errorstr, 512);
-    if (hdl->rdk_conn == NULL) {
-        fprintf(stderr, "Error creating rdkafka consumer: %s\n", errorstr);
+    if (rd_kafka_conf_set(conf, "bootstrap.servers", hdl->brokers,
+                errorstr, 512) != RD_KAFKA_CONF_OK) {
+        fprintf(stderr, "Error setting bootstrap servers: %s\n", errorstr);
         rd_kafka_conf_destroy(conf);
         return -1;
     }
 
-    if (rd_kafka_brokers_add(hdl->rdk_conn, hdl->brokers) == 0) {
-        fprintf(stderr, "Error adding brokers to rdkafka consumer: %s\n",
-                errorstr);
+    if (rd_kafka_conf_set(conf, "enable.auto.commit", "true",
+                errorstr, 512) != RD_KAFKA_CONF_OK) {
+        fprintf(stderr, "Error setting auto commit: %s\n", errorstr);
+        rd_kafka_conf_destroy(conf);
+        return -1;
+    }
+
+    if (rd_kafka_conf_set(conf, "auto.offset.reset", "earliest",
+                errorstr, 512) != RD_KAFKA_CONF_OK) {
+        fprintf(stderr, "Error setting auto commit: %s\n", errorstr);
+        rd_kafka_conf_destroy(conf);
+        return -1;
+    }
+
+    hdl->rdk_conn = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errorstr, 512);
+    if (hdl->rdk_conn == NULL) {
+        fprintf(stderr, "Error creating rdkafka consumer: %s\n", errorstr);
+        rd_kafka_conf_destroy(conf);
         return -1;
     }
 
@@ -375,6 +457,8 @@ int rdkafka_consumer_connect(kafka_consumer_handle_t *hdl) {
     if (hdl->fatal_error) {
         return -1;
     }
+    fprintf(stderr, "Kafka consumer connected to %s (%s)\n", hdl->brokers,
+            hdl->consumer_group);
     return 0;
 }
 
@@ -393,7 +477,7 @@ int rdkafka_topic_connect(kafka_consumer_handle_t *hdl) {
     }
 
     if (rd_kafka_consume_start(hdl->rdk_topic, 0,
-                RD_KAFKA_OFFSET_BEGINNING) == -1) {
+                RD_KAFKA_OFFSET_STORED) == -1) {
         fprintf(stderr, "Error while starting the kafka consumer: %s\n",
                 rd_kafka_err2str(rd_kafka_last_error()));
         rd_kafka_topic_destroy(hdl->rdk_topic);
@@ -401,6 +485,8 @@ int rdkafka_topic_connect(kafka_consumer_handle_t *hdl) {
         return -1;
     }
 
+    fprintf(stderr, "Started consuming from kafka topic: %s\n",
+            hdl->topicname);
     return 0;
 }
 
@@ -448,6 +534,8 @@ static inline int update_timeseries_value(timeseries_kp_t *kp,
         snprintf(fulltskey, 8192, "active.ping-slash24.geo.ipinfo.%s.%s.%s.%s",
                 identifier, teamname, final ? "final" : "provisional", metric);
     } else if (resulttype == RESULT_TYPE_ASN) {
+        snprintf(fulltskey, 8192, "active.ping-slash24.%s.%s.%s.%s",
+                identifier, teamname, final ? "final" : "provisional", metric);
 
     } else if (resulttype == RESULT_TYPE_GEOASN_COUNTRY) {
 
@@ -571,7 +659,7 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
     uint64_t timestamp, value, num_ips;
     ipmeta_record_t *rec;
     char identifier[512];
-
+    struct timeval tv;
 
     errno = 0;
     s24_saddr = strtoul(s24_key, NULL, 10);
@@ -598,12 +686,21 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
         return 0;
     }
 
+    if (timestamp != hdl->results.last_timestamp) {
+        gettimeofday(&tv, NULL);
+        fprintf(stderr, "Started processing timestamp %lu at %lu\n",
+                timestamp, tv.tv_sec);
+    }
     if (timestamp != hdl->results.last_timestamp &&
             hdl->results.last_timestamp != 0) {
 
         /* end of round -- dump results and reset */
         emit_results_to_kafka(prodhdl, &(hdl->results.countries),
                 hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_GEO);
+        emit_results_to_kafka(prodhdl, &(hdl->results.regions),
+                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_GEO);
+        emit_results_to_kafka(prodhdl, &(hdl->results.asns),
+                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_ASN);
     }
     hdl->results.last_timestamp = timestamp;
 
@@ -616,6 +713,10 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
 
         commit_staged_results(&(hdl->staged.countries),
                 &(hdl->results.countries));
+        commit_staged_results(&(hdl->staged.regions),
+                &(hdl->results.regions));
+        commit_staged_results(&(hdl->staged.asns),
+                &(hdl->results.asns));
 
         hdl->results.last_s24 = s24_saddr;
     }
@@ -628,6 +729,18 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
                     metric, num_ips, value);
 
         }
+        if (rec->region_code != 0) {
+            snprintf(identifier, 512, "region.%d", rec->region_code);
+            update_staged_result_map(&(hdl->staged.regions), identifier,
+                    metric, num_ips, value);
+        }
+        if (rec->asn_cnt > 0) {
+            // ignore ASN groups for now
+            snprintf(identifier, 512, "asn.%u", rec->asn[0]);
+            update_staged_result_map(&(hdl->staged.asns), identifier, metric,
+                    num_ips, value);
+        }
+
     }
 
     return 1;
@@ -649,7 +762,7 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
 
 
         /* XXX TEMPORARY */
-        if (prodhdl->produced >= 2) {
+        if (prodhdl->produced >= 8) {
             rd_kafka_consume_stop(hdl->rdk_topic, 0);
             return -1;
         }
@@ -758,7 +871,7 @@ nextline:
 
 static void usage(char *progname) {
 
-    fprintf(stderr, "Usage: %s -b <broker> -p <ipinfo config> -a <pfx2as config> [ other options ]\n", progname);
+    fprintf(stderr, "Usage: %s -b <broker> -p <ipinfo config> -a <pfx2as config> -R <regions csv> [ other options ]\n", progname);
     fprintf(stderr, "\n");
     fprintf(stderr, "    -b <brokers>  --  set the Kafka broker for receiving prober results\n");
     fprintf(stderr, "    -p \"<config>\"  -- set the IPInfo configuration for libipmeta\n");
@@ -767,6 +880,7 @@ static void usage(char *progname) {
     fprintf(stderr, "    -M \"<teamname>\"    -- only process measurements from probers belonging to \n    this team (default: team-2)\n");
     fprintf(stderr, "    -t <topicname>   -- set the topic to consume messages from\n");
     fprintf(stderr, "    -T <topicname>   -- set the topic to write aggregated results into\n");
+    fprintf(stderr, "    -R <filepath>    -- path to the regions CSV file\n");
     fprintf(stderr, "    -B <brokers>     -- set the Kafka broker for producing aggregated results\n");
     fprintf(stderr, "                        (if different from the broker set using '-b'\n");
 
@@ -784,7 +898,7 @@ int main(int argc, char **argv) {
     memset(&prodhdl, 0, sizeof(prodhdl));
     memset(&ipm, 0, sizeof(ipm));
 
-    while ((opt = getopt(argc, argv, "M:g:t:T:b:B:p:a:")) >= 0) {
+    while ((opt = getopt(argc, argv, "R:M:g:t:T:b:B:p:a:")) >= 0) {
         switch(opt) {
             case 'M':
                 kafkahdl.teamname = optarg;
@@ -810,6 +924,10 @@ int main(int argc, char **argv) {
             case 'a':
                 ipm.config_pfx2as = optarg;
                 break;
+            case 'R':
+                ipm.regions_csv_file = optarg;
+                break;
+
             default:
                 usage(argv[0]);
         }
@@ -850,6 +968,11 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    if (ipm.regions_csv_file == NULL) {
+        fprintf(stderr, "Please specify the path to the regions CSV file using -R\n");
+        exit(1);
+    }
+
     if (init_libtimeseries(&prodhdl) < 0) {
         fprintf(stderr, "Failed to initialize libtimeseries for kafka output\n");
         exit(1);
@@ -875,6 +998,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    clear_results(&(kafkahdl.results.asns));
+    clear_results(&(kafkahdl.results.regions));
     clear_results(&(kafkahdl.results.countries));
     destroy_ipmeta(&ipm);
     destroy_libtimeseries(&prodhdl);
