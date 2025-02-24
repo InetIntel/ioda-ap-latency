@@ -69,6 +69,8 @@ typedef struct kafka_producer_handle {
     timeseries_t *timeseries;
     timeseries_kp_t *kp;
     uint32_t produced;
+
+    time_t next_prov_write;
 } kafka_producer_handle_t;
 
 
@@ -133,7 +135,8 @@ static int init_libtimeseries(kafka_producer_handle_t *hdl) {
         return -1;
     }
 
-    hdl->kp = timeseries_kp_init(hdl->timeseries, TIMESERIES_KP_RESET);
+    hdl->kp = timeseries_kp_init(hdl->timeseries,
+                (TIMESERIES_KP_RESET | TIMESERIES_KP_DISABLE));
     if (!hdl->kp) {
         fprintf(stderr, "Unable to initialize key package for libtimeseries\n");
         return -1;
@@ -292,6 +295,7 @@ static void reset_all_results(Pvoid_t *map) {
         cr->latency = 0;
         cr->probes_sent = 0;
         cr->probes_lost = 0;
+        cr->s24_ips = 0;
         JSLN(pval, *map, index);
     }
 }
@@ -490,7 +494,8 @@ int rdkafka_topic_connect(kafka_consumer_handle_t *hdl) {
     return 0;
 }
 
-static void commit_staged_results(Pvoid_t *staged, Pvoid_t *results) {
+static void commit_staged_results_single_map(Pvoid_t *staged,
+        Pvoid_t *results) {
 
     PWord_t pval, pval2;
     Word_t rc;
@@ -522,6 +527,16 @@ static void commit_staged_results(Pvoid_t *staged, Pvoid_t *results) {
     JSLFA(rc, *staged);
 }
 
+static void commit_staged_results(kafka_consumer_handle_t *hdl) {
+    commit_staged_results_single_map(&(hdl->staged.countries),
+            &(hdl->results.countries));
+    commit_staged_results_single_map(&(hdl->staged.regions),
+            &(hdl->results.regions));
+    commit_staged_results_single_map(&(hdl->staged.asns),
+            &(hdl->results.asns));
+
+}
+
 static inline int update_timeseries_value(timeseries_kp_t *kp,
         char *identifier, char *teamname,
         uint8_t final, char *metric, uint8_t resulttype,
@@ -549,6 +564,8 @@ static inline int update_timeseries_value(timeseries_kp_t *kp,
     kval = timeseries_kp_get_key(kp, fulltskey);
     if (kval == -1) {
         kval = timeseries_kp_add_key(kp, fulltskey);
+    } else {
+        timeseries_kp_enable_key(kp, kval);
     }
     if (kval == -1) {
         fprintf(stderr, "Warning: unable to add timeseries key for %s\n",
@@ -559,7 +576,7 @@ static inline int update_timeseries_value(timeseries_kp_t *kp,
     return 0;
 }
 
-static void emit_results_to_kafka(kafka_producer_handle_t *hdl,
+static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
         Pvoid_t *map, uint64_t timestamp, char *teamname, uint8_t final,
         uint8_t resulttype) {
 
@@ -573,8 +590,6 @@ static void emit_results_to_kafka(kafka_producer_handle_t *hdl,
     index[0] = '\0';
 
     gettimeofday(&tv, NULL);
-    fprintf(stderr, "%lu -- Generating results for round %u (%lu)\n", tv.tv_sec,
-            hdl->produced + 1, timestamp);
     JSLF(pval, *map, index);
     while (pval) {
         cr = (cumulative_result_t *)(*pval);
@@ -604,18 +619,27 @@ static void emit_results_to_kafka(kafka_producer_handle_t *hdl,
             return;
         }
 
-        cr->latency = 0;
-        cr->probes_sent = 0;
-        cr->probes_lost = 0;
+        if (final) {
+            cr->latency = 0;
+            cr->probes_sent = 0;
+            cr->probes_lost = 0;
+            cr->s24_ips = 0;
+        }
 
         JSLN(pval, *map, index);
     }
 
-    timeseries_kp_flush(hdl->kp, timestamp);
-    gettimeofday(&tv, NULL);
-    fprintf(stderr, "%lu -- Flushed results for round %u (%lu)\n", tv.tv_sec,
-            hdl->produced + 1, timestamp);
-    hdl->produced ++;
+}
+
+static void emit_results_to_kafka(kafka_consumer_handle_t *hdl,
+        kafka_producer_handle_t *prodhdl, uint8_t final) {
+
+    emit_result_map_to_kafka(prodhdl, &(hdl->results.countries),
+            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_GEO);
+    emit_result_map_to_kafka(prodhdl, &(hdl->results.regions),
+            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_GEO);
+    emit_result_map_to_kafka(prodhdl, &(hdl->results.asns),
+            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_ASN);
 }
 
 static void update_staged_result_map(Pvoid_t *map, char *identifier,
@@ -690,17 +714,24 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
         gettimeofday(&tv, NULL);
         fprintf(stderr, "Started processing timestamp %lu at %lu\n",
                 timestamp, tv.tv_sec);
+        prodhdl->next_prov_write = tv.tv_sec + 30;
     }
     if (timestamp != hdl->results.last_timestamp &&
             hdl->results.last_timestamp != 0) {
 
         /* end of round -- dump results and reset */
-        emit_results_to_kafka(prodhdl, &(hdl->results.countries),
-                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_GEO);
-        emit_results_to_kafka(prodhdl, &(hdl->results.regions),
-                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_GEO);
-        emit_results_to_kafka(prodhdl, &(hdl->results.asns),
-                hdl->results.last_timestamp, hdl->teamname, 1, RESULT_TYPE_ASN);
+        fprintf(stderr,
+                "%lu -- Generating final results for round %u (%lu)\n",
+                tv.tv_sec, prodhdl->produced + 1, hdl->results.last_timestamp);
+        commit_staged_results(hdl);
+        emit_results_to_kafka(hdl, prodhdl, 1);
+        timeseries_kp_flush(prodhdl->kp, hdl->results.last_timestamp);
+        gettimeofday(&tv, NULL);
+        fprintf(stderr,
+                "%lu -- Flushed results for round %u (%lu)\n", tv.tv_sec,
+               prodhdl->produced + 1, hdl->results.last_timestamp);
+        prodhdl->produced ++;
+        reset_results(hdl, ipm);
     }
     hdl->results.last_timestamp = timestamp;
 
@@ -711,13 +742,7 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
         ipmeta_lookup_pfx(ipm->ipmeta, AF_INET,
                 (void *)(&swap_saddr), 24, 0, ipm->records);
 
-        commit_staged_results(&(hdl->staged.countries),
-                &(hdl->results.countries));
-        commit_staged_results(&(hdl->staged.regions),
-                &(hdl->results.regions));
-        commit_staged_results(&(hdl->staged.asns),
-                &(hdl->results.asns));
-
+        commit_staged_results(hdl);
         hdl->results.last_s24 = s24_saddr;
     }
     ipmeta_record_set_rewind(ipm->records);
@@ -748,6 +773,7 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
 
 int rdkafka_consume(kafka_consumer_handle_t *hdl,
         kafka_producer_handle_t *prodhdl, ipmeta_handle_t *ipm) {
+    struct timeval tv;
     if (hdl->rdk_topic == NULL && rdkafka_topic_connect(hdl) < 0) {
         sleep(1);
         return -1;
@@ -760,12 +786,6 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
         char *dotptr = NULL;
         char *token, *token2, *token3;
 
-
-        /* XXX TEMPORARY */
-        if (prodhdl->produced >= 8) {
-            rd_kafka_consume_stop(hdl->rdk_topic, 0);
-            return -1;
-        }
         rd_kafka_poll(hdl->rdk_conn, 0);
 
         if (hdl->fatal_error) {
@@ -779,6 +799,21 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
                         "Error while retrieving message from kafka: %s\n",
                         strerror(errno));
                 return -1;
+            }
+            gettimeofday(&tv, NULL);
+            if (prodhdl->next_prov_write != 0 &&
+                    tv.tv_sec >= prodhdl->next_prov_write) {
+                fprintf(stderr,
+                        "%lu: writing provisional results for %lu\n",
+                        tv.tv_sec, hdl->results.last_timestamp);
+                commit_staged_results(hdl);
+                emit_results_to_kafka(hdl, prodhdl, 0);
+                timeseries_kp_flush(prodhdl->kp, hdl->results.last_timestamp);
+                gettimeofday(&tv, NULL);
+                fprintf(stderr,
+                        "%lu: flushed provisional results for %lu\n",
+                        tv.tv_sec, hdl->results.last_timestamp);
+                prodhdl->next_prov_write = 0;
             }
             continue;
         }
