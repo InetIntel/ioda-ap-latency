@@ -342,7 +342,6 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
 
     ipmeta_record_t **records;
     const char **countries_iso2;
-    const char **country_continents;
     char key[512];
     int cnt, i, rc;
     Word_t index;
@@ -353,6 +352,7 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
     }
     free(records);
 
+    reset_all_results(&(hdl->results.continents));
     reset_all_results(&(hdl->results.countries));
     reset_all_results(&(hdl->results.regions));
     reset_all_results(&(hdl->results.asns));
@@ -362,6 +362,11 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
     for (i = 0; i < cnt; i++) {
         snprintf(key, 512, "country.%s", countries_iso2[i]);
         insert_single_result(&(hdl->results.countries), key);
+    }
+
+    for (i = 0; i < CONTINENT_COUNT; i++) {
+        snprintf(key, 512, "continent.%s", continent_strings[i]);
+        insert_single_result(&(hdl->results.continents), key);
     }
 
     index = 0;
@@ -380,7 +385,7 @@ static void kafka_error_callback(rd_kafka_t *rk, int err, const char *reason,
         void *opaque) {
 
     kafka_consumer_handle_t *hdl = (kafka_consumer_handle_t *)opaque;
-
+    (void)rk;
     switch (err) {
         case RD_KAFKA_RESP_ERR__BAD_COMPRESSION:
         case RD_KAFKA_RESP_ERR__RESOLVE:
@@ -528,6 +533,8 @@ static void commit_staged_results_single_map(Pvoid_t *staged,
 }
 
 static void commit_staged_results(kafka_consumer_handle_t *hdl) {
+    commit_staged_results_single_map(&(hdl->staged.continents),
+            &(hdl->results.continents));
     commit_staged_results_single_map(&(hdl->staged.countries),
             &(hdl->results.countries));
     commit_staged_results_single_map(&(hdl->staged.regions),
@@ -577,8 +584,7 @@ static inline int update_timeseries_value(timeseries_kp_t *kp,
 }
 
 static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
-        Pvoid_t *map, uint64_t timestamp, char *teamname, uint8_t final,
-        uint8_t resulttype) {
+        Pvoid_t *map, char *teamname, uint8_t final, uint8_t resulttype) {
 
     PWord_t pval;
     cumulative_result_t *cr;
@@ -634,12 +640,14 @@ static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
 static void emit_results_to_kafka(kafka_consumer_handle_t *hdl,
         kafka_producer_handle_t *prodhdl, uint8_t final) {
 
+    emit_result_map_to_kafka(prodhdl, &(hdl->results.continents),
+            hdl->teamname, final, RESULT_TYPE_GEO);
     emit_result_map_to_kafka(prodhdl, &(hdl->results.countries),
-            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_GEO);
+            hdl->teamname, final, RESULT_TYPE_GEO);
     emit_result_map_to_kafka(prodhdl, &(hdl->results.regions),
-            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_GEO);
+            hdl->teamname, final, RESULT_TYPE_GEO);
     emit_result_map_to_kafka(prodhdl, &(hdl->results.asns),
-            hdl->results.last_timestamp, hdl->teamname, final, RESULT_TYPE_ASN);
+            hdl->teamname, final, RESULT_TYPE_ASN);
 }
 
 static void update_staged_result_map(Pvoid_t *map, char *identifier,
@@ -754,6 +762,13 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
                     metric, num_ips, value);
 
         }
+
+        if (rec->continent_code[0] != '\0') {
+            snprintf(identifier, 512, "continent.%s", rec->continent_code);
+            update_staged_result_map(&(hdl->staged.continents), identifier,
+                    metric, num_ips, value);
+        }
+
         if (rec->region_code != 0) {
             snprintf(identifier, 512, "region.%d", rec->region_code);
             update_staged_result_map(&(hdl->staged.regions), identifier,
@@ -1036,6 +1051,7 @@ int main(int argc, char **argv) {
     clear_results(&(kafkahdl.results.asns));
     clear_results(&(kafkahdl.results.regions));
     clear_results(&(kafkahdl.results.countries));
+    clear_results(&(kafkahdl.results.continents));
     destroy_ipmeta(&ipm);
     destroy_libtimeseries(&prodhdl);
 
