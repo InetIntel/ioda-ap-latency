@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
-LIBS = -lrdkafka -lipmeta -lJudy -ltimeseries -lwandio
+LIBS = -lrdkafka -lipmeta -lJudy -ltimeseries -lwandio -lgsl
 
 SRCS = aggregator.c
 OBJS = $(SRCS:.c=.o)

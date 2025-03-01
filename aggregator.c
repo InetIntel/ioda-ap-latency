@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <gsl/gsl_histogram.h>
 
 #define DEFAULT_CONSUMER_TOPIC "tsk-production.graphite.active.ping-slash24.team-1.slash24test"
 #define DEFAULT_PRODUCER_TOPIC "graphite.active.latencyloss"
@@ -94,6 +95,7 @@ typedef struct cumulative_result {
     uint64_t latency;
     uint64_t probes_sent;
     uint64_t probes_lost;
+    gsl_histogram *lat_hist;
 
     uint64_t s24_ips;       // used only for staging
 } cumulative_result_t;
@@ -296,6 +298,9 @@ static void reset_all_results(Pvoid_t *map) {
         cr->probes_sent = 0;
         cr->probes_lost = 0;
         cr->s24_ips = 0;
+        if (cr->lat_hist) {
+            gsl_histogram_reset(cr->lat_hist);
+        }
         JSLN(pval, *map, index);
     }
 }
@@ -314,6 +319,9 @@ static void clear_results(Pvoid_t *map) {
             if (cr->identifier) {
                 free(cr->identifier);
             }
+            if (cr->lat_hist) {
+                gsl_histogram_free(cr->lat_hist);
+            }
             free(cr);
         }
         JSLN(pval, *map, index);
@@ -322,20 +330,25 @@ static void clear_results(Pvoid_t *map) {
 }
 
 
-static void insert_single_result(Pvoid_t *map, char *identifier) {
+static cumulative_result_t *insert_single_result(Pvoid_t *map,
+        char *identifier) {
     PWord_t pval;
     cumulative_result_t *cr;
 
     JSLI(pval, *map, (uint8_t *)identifier);
     if (*pval) {
-        return;
+        return (cumulative_result_t *)(*pval);
     }
     cr = calloc(1, sizeof(cumulative_result_t));
+    cr->lat_hist = gsl_histogram_alloc(500);
+    gsl_histogram_set_ranges_uniform(cr->lat_hist, 0, 500000);
+
     cr->identifier = strdup(identifier);
     cr->latency = 0;
     cr->probes_sent = 0;
     cr->probes_lost = 0;
     *pval = (Word_t)cr;
+    return cr;
 }
 
 static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
@@ -361,19 +374,25 @@ static int reset_results(kafka_consumer_handle_t *hdl, ipmeta_handle_t *ipm) {
 
     for (i = 0; i < cnt; i++) {
         snprintf(key, 512, "country.%s", countries_iso2[i]);
-        insert_single_result(&(hdl->results.countries), key);
+        if (insert_single_result(&(hdl->results.countries), key) == NULL) {
+            return -1;
+        }
     }
 
     for (i = 0; i < CONTINENT_COUNT; i++) {
         snprintf(key, 512, "continent.%s", continent_strings[i]);
-        insert_single_result(&(hdl->results.continents), key);
+        if (insert_single_result(&(hdl->results.continents), key) == NULL) {
+            return -1;
+        }
     }
 
     index = 0;
     J1F(rc, ipm->known_regions, index);
     while (rc != 0) {
         snprintf(key, 512, "region.%lu", index);
-        insert_single_result(&(hdl->results.regions), key);
+        if (insert_single_result(&(hdl->results.regions), key) == NULL) {
+            return -1;
+        }
         J1N(rc, ipm->known_regions, index);
     }
 
@@ -512,21 +531,29 @@ static void commit_staged_results_single_map(Pvoid_t *staged,
     while(pval) {
         cr = (cumulative_result_t *)(*pval);
 
-        if (cr->s24_ips >= IPMETA_INCLUDE_SLASH24_THRESHOLD) {
+        /* Anything over 500 is probably an outlier... */
+        if (cr->latency < 500000 &&
+                cr->s24_ips >= IPMETA_INCLUDE_SLASH24_THRESHOLD) {
             JSLI(pval2, *results, index);
             if (*pval2 == 0) {
-                *pval2 = (Word_t)cr;
+                cr2 = insert_single_result(results, cr->identifier);
+                *pval2 = (Word_t)cr2;
             } else {
                 cr2 = (cumulative_result_t *)(*pval2);
-                cr2->latency += cr->latency;
-                cr2->probes_sent += cr->probes_sent;
-                cr2->probes_lost += cr->probes_lost;
-
             }
-        } else {
-            free(cr->identifier);
-            free(cr);
+            if (cr->latency > 0) {
+                gsl_histogram_increment(cr2->lat_hist, cr->latency);
+            }
+            cr2->latency += cr->latency;
+            cr2->probes_sent += cr->probes_sent;
+            cr2->probes_lost += cr->probes_lost;
         }
+
+        free(cr->identifier);
+        if (cr->lat_hist) {
+            gsl_histogram_free(cr->lat_hist);
+        }
+        free(cr);
         JSLN(pval, *staged, index);
     }
     JSLFA(rc, *staged);
@@ -583,6 +610,69 @@ static inline int update_timeseries_value(timeseries_kp_t *kp,
     return 0;
 }
 
+static void get_histogram_statistics(kafka_producer_handle_t *hdl,
+        char *identifier, char *teamname, uint8_t final, uint8_t resulttype,
+        gsl_histogram *hist, uint64_t expected) {
+
+    size_t pct_target, i;
+    double histsum = 0;
+    double upper, lower;
+
+    double pcts[5] = {0.0, 0.1, 0.5, 0.9, 1.0};
+    double results[5] = {0, 0, 0, 0, 0};
+
+    pct_target = 0;
+    for (i = 0; i < 500; i++) {
+        double cnt = gsl_histogram_get(hist, i);
+
+        if (cnt == 0) {
+            continue;
+        }
+
+        gsl_histogram_get_range(hist, i, &lower, &upper);
+        histsum += cnt;
+        while (histsum >= pcts[pct_target] * expected && pct_target < 5) {
+            results[pct_target] = upper;
+            pct_target ++;
+        }
+    }
+
+    if (pct_target != 5) {
+        return;
+    }
+
+    if (pct_target > 0 && update_timeseries_value(hdl->kp, identifier,
+                teamname, final, "min_latency", resulttype,
+                (uint64_t)(results[0])) < 0) {
+        return;
+    }
+
+    if (pct_target > 1 && update_timeseries_value(hdl->kp, identifier,
+                teamname, final, "p10_latency", resulttype,
+                (uint64_t)(results[1])) < 0) {
+        return;
+    }
+
+    if (pct_target > 2 && update_timeseries_value(hdl->kp, identifier,
+                teamname, final, "median_latency", resulttype,
+                (uint64_t)(results[2])) < 0) {
+        return;
+    }
+
+    if (pct_target > 3 && update_timeseries_value(hdl->kp, identifier,
+                teamname, final, "p90_latency", resulttype,
+                (uint64_t)(results[3])) < 0) {
+        return;
+    }
+
+    if (pct_target > 4 && update_timeseries_value(hdl->kp, identifier,
+                teamname, final, "max_latency", resulttype,
+                (uint64_t)(results[4])) < 0) {
+        return;
+    }
+
+}
+
 static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
         Pvoid_t *map, char *teamname, uint8_t final, uint8_t resulttype) {
 
@@ -600,10 +690,15 @@ static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
     while (pval) {
         cr = (cumulative_result_t *)(*pval);
 
-        /* TODO add other statistics for latency, e.g. median, percentiles */
-
         if (cr->probes_sent > 0) {
             if (cr->latency > 0 && cr->probes_lost < cr->probes_sent) {
+                if (cr->lat_hist) {
+
+                    get_histogram_statistics(hdl, cr->identifier, teamname,
+                            final, resulttype, cr->lat_hist,
+                            cr->probes_sent - cr->probes_lost);
+                }
+
                 addval = (uint64_t)(cr->latency /
                         (cr->probes_sent - cr->probes_lost));
                 if (update_timeseries_value(hdl->kp, cr->identifier,
@@ -630,6 +725,7 @@ static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
             cr->probes_sent = 0;
             cr->probes_lost = 0;
             cr->s24_ips = 0;
+            gsl_histogram_reset(cr->lat_hist);
         }
 
         JSLN(pval, *map, index);
@@ -660,6 +756,7 @@ static void update_staged_result_map(Pvoid_t *map, char *identifier,
     if (*pval == 0) {
         cr = calloc(1, sizeof(cumulative_result_t));
         cr->identifier = strdup(identifier);
+        cr->lat_hist = NULL;        // don't need a histogram at this level */
         *pval = (Word_t)cr;
     } else {
         cr = (cumulative_result_t *)(*pval);
@@ -853,7 +950,6 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
         char *key, *valuestr, *timestr, *lastkey, *s24key;
         uint8_t key_skip;
 
-        // TODO
         //  * split message payload into individual lines
         //  * discard all lines with unrelated keys
         //    * including team-2 results during dev/testing
