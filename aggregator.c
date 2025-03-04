@@ -520,6 +520,11 @@ int rdkafka_consumer_connect(kafka_consumer_handle_t *hdl) {
     if (hdl->fatal_error) {
         return -1;
     }
+
+    if (hdl->rdk_topic) {
+        rd_kafka_topic_destroy(hdl->rdk_topic);
+        hdl->rdk_topic = NULL;
+    }
     fprintf(stderr, "Kafka consumer connected to %s (%s)\n", hdl->brokers,
             hdl->consumer_group);
     return 0;
