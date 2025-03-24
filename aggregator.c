@@ -49,7 +49,7 @@
 #include <getopt.h>
 #include <gsl/gsl_histogram.h>
 
-#define DEFAULT_CONSUMER_TOPIC "tsk-production.graphite.active.ping-slash24.team-1.slash24test"
+#define DEFAULT_CONSUMER_TOPIC "tsk-production.graphite.active.ping-slash24.team-1.slash24"
 #define DEFAULT_PRODUCER_TOPIC "graphite.active.latencyloss"
 
 #define DEFAULT_CONSUMER_GROUP "ap_slash24_aggregator"
