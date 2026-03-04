@@ -143,11 +143,13 @@ static int init_libtimeseries(kafka_producer_handle_t *hdl) {
 
     if (hdl->brokers == NULL) {
         fprintf(stderr, "No brokers specified for kafka output!\n");
+        destroy_libtimeseries(hdl);
         return -1;
     }
 
     if (hdl->topicname == NULL) {
         fprintf(stderr, "No topicname specified for kafka output!\n");
+        destroy_libtimeseries(hdl);
         return -1;
     }
 
@@ -157,18 +159,21 @@ static int init_libtimeseries(kafka_producer_handle_t *hdl) {
     hdl->timeseries = timeseries_init();
     if (hdl->timeseries == NULL) {
         fprintf(stderr, "Unable to initialize timeseries_t\n");
+        destroy_libtimeseries(hdl);
         return -1;
     }
 
     backend = timeseries_get_backend_by_name(hdl->timeseries, "kafka");
     if (backend == NULL) {
         fprintf(stderr, "Kafka backend is not supported by your current version of libtimeseries\n");
+        destroy_libtimeseries(hdl);
         return -1;
     }
 
     if (timeseries_enable_backend(backend, tmpbuf) != 0) {
         fprintf(stderr, "Unable to enable Kafka backend with arguments '%s'\n",
                 tmpbuf);
+        destroy_libtimeseries(hdl);
         return -1;
     }
 
@@ -176,6 +181,7 @@ static int init_libtimeseries(kafka_producer_handle_t *hdl) {
                 (TIMESERIES_KP_RESET | TIMESERIES_KP_DISABLE));
     if (!hdl->kp) {
         fprintf(stderr, "Unable to initialize key package for libtimeseries\n");
+        destroy_libtimeseries(hdl);
         return -1;
     }
     return 0;
@@ -443,8 +449,6 @@ static void kafka_error_callback(rd_kafka_t *rk, int err, const char *reason,
     switch (err) {
         case RD_KAFKA_RESP_ERR__BAD_COMPRESSION:
         case RD_KAFKA_RESP_ERR__RESOLVE:
-            hdl->fatal_error = 1;
-            // fall through
         case RD_KAFKA_RESP_ERR__DESTROY:
         case RD_KAFKA_RESP_ERR__FAIL:
         case RD_KAFKA_RESP_ERR__TRANSPORT:
@@ -773,8 +777,41 @@ static void emit_result_map_to_kafka(kafka_producer_handle_t *hdl,
 
 }
 
+static int flush_results_to_kafka(kafka_producer_handle_t *prodhdl,
+        uint64_t timestamp) {
+
+    if (prodhdl->kp == NULL) {
+        if (init_libtimeseries(prodhdl) < 0) {
+            fprintf(stderr, "Failed to initialize producer for flush attempt\n");
+            return -1;
+        }
+    }
+
+    if (timeseries_kp_flush(prodhdl->kp, timestamp) < 0) {
+        fprintf(stderr, "Failed to flush timeseries results to Kafka, attempting producer re-init\n");
+        destroy_libtimeseries(prodhdl);
+        if (init_libtimeseries(prodhdl) == 0) {
+            if (timeseries_kp_flush(prodhdl->kp, timestamp) < 0) {
+                fprintf(stderr, "Retry flush failed\n");
+                return -1;
+            } else {
+                fprintf(stderr, "Retry flush succeeded\n");
+            }
+        } else {
+            fprintf(stderr, "Producer re-init failed\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void emit_results_to_kafka(kafka_consumer_handle_t *hdl,
         kafka_producer_handle_t *prodhdl, uint8_t final) {
+    if (prodhdl->kp == NULL) {
+        if (init_libtimeseries(prodhdl) < 0) {
+             return;
+        }
+    }
 
     emit_result_map_to_kafka(prodhdl, &(hdl->results.continents),
             hdl->teamname, final, RESULT_TYPE_GEO);
@@ -870,7 +907,7 @@ static int process_received_result(kafka_consumer_handle_t *hdl,
                 tv.tv_sec, prodhdl->produced + 1, hdl->results.last_timestamp);
         commit_staged_results(hdl);
         emit_results_to_kafka(hdl, prodhdl, 1);
-        timeseries_kp_flush(prodhdl->kp, hdl->results.last_timestamp);
+        flush_results_to_kafka(prodhdl, hdl->results.last_timestamp);
         gettimeofday(&tv, NULL);
         fprintf(stderr,
                 "%lu -- Flushed results for round %u (%lu)\n", tv.tv_sec,
@@ -960,7 +997,7 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
                         tv.tv_sec, hdl->results.last_timestamp);
                 commit_staged_results(hdl);
                 emit_results_to_kafka(hdl, prodhdl, 0);
-                timeseries_kp_flush(prodhdl->kp, hdl->results.last_timestamp);
+                flush_results_to_kafka(prodhdl, hdl->results.last_timestamp);
                 gettimeofday(&tv, NULL);
                 fprintf(stderr,
                         "%lu: flushed provisional results for %lu\n",
@@ -979,12 +1016,7 @@ int rdkafka_consume(kafka_consumer_handle_t *hdl,
             fprintf(stderr, "Error while consuming kafka message: %s\n",
                     rd_kafka_message_errstr(msg));
             rd_kafka_message_destroy(msg);
-            rd_kafka_topic_destroy(hdl->rdk_topic);
-            rd_kafka_destroy(hdl->rdk_conn);
-            hdl->rdk_topic = NULL;
-            hdl->rdk_conn = NULL;
-            hdl->connected = 0;
-            break;
+            return -1;
         }
 
         char *key, *valuestr, *timestr, *lastkey, *s24key;
@@ -1180,7 +1212,20 @@ int main(int argc, char **argv) {
         }
 
         if (rdkafka_consume(&kafkahdl, &prodhdl, &ipm) < 0) {
-            break;
+            fprintf(stderr, "Kafka consumption failed, attempting to reconnect in 5s\n");
+            if (kafkahdl.rdk_topic) {
+                rd_kafka_consume_stop(kafkahdl.rdk_topic, 0);
+                rd_kafka_topic_destroy(kafkahdl.rdk_topic);
+                kafkahdl.rdk_topic = NULL;
+            }
+            if (kafkahdl.rdk_conn) {
+                rd_kafka_consumer_close(kafkahdl.rdk_conn);
+                rd_kafka_destroy(kafkahdl.rdk_conn);
+                kafkahdl.rdk_conn = NULL;
+            }
+            kafkahdl.connected = 0;
+            sleep(5);
+            continue;
         }
     }
 
