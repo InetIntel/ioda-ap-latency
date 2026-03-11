@@ -135,6 +135,15 @@ typedef struct cumulative_result {
     uint64_t s24_ips;       // used only for staging
 } cumulative_result_t;
 
+static void destroy_libtimeseries(kafka_producer_handle_t *hdl) {
+    if (hdl->kp) {
+        timeseries_kp_free(&(hdl->kp));
+    }
+    if (hdl->timeseries) {
+        timeseries_free(&(hdl->timeseries));
+    }
+}
+
 
 static int init_libtimeseries(kafka_producer_handle_t *hdl) {
 
@@ -185,15 +194,6 @@ static int init_libtimeseries(kafka_producer_handle_t *hdl) {
         return -1;
     }
     return 0;
-}
-
-static void destroy_libtimeseries(kafka_producer_handle_t *hdl) {
-    if (hdl->kp) {
-        timeseries_kp_free(&(hdl->kp));
-    }
-    if (hdl->timeseries) {
-        timeseries_free(&(hdl->timeseries));
-    }
 }
 
 static int load_ipmeta_regions(ipmeta_handle_t *ipm) {
